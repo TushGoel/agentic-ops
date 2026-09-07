@@ -1,18 +1,18 @@
 # agentic-ops
 
 ![Status](https://img.shields.io/badge/status-production-brightgreen)
-![Impact](https://img.shields.io/badge/toil%20reduction-95%25-blue)
-![Adoption](https://img.shields.io/badge/team%20adoption-75%25-orange)
+![Impact](https://img.shields.io/badge/toil%20reduction-significant-blue)
+![Adoption](https://img.shields.io/badge/team%20adoption-strong-orange)
 
-> I built a production AI agent that eliminated 95% of manual oncall triage on a CI/CD and migration platform serving **25,000+ internal teams** and **500,000+ end customers**. The same platform handles a large-scale BI migration processing millions of dashboard assets. Here's every architecture decision, tradeoff, and lesson learned.
+> I built a production AI agent that eliminated the majority of manual oncall triage on a large-scale CI/CD and data platform. Here's every architecture decision, tradeoff, and lesson learned.
 
 ---
 
 ## The Problem
 
-The platform this agent runs on serves **25,000+ internal teams** — each supporting 15–20 end customers — reaching **500,000+ end customers** whose experience depends directly on deployment reliability. On top of ongoing production deployments, the platform also owns a large-scale BI migration processing **millions of dashboard assets**.
+The platform this agent runs on serves a large number of internal teams whose end-customer experience depends directly on deployment reliability. On top of ongoing production deployments, the platform also runs a large-scale data migration.
 
-Running oncall at this scale means **30–40 deployment failure tickets per week** — each requiring the same investigation cycle:
+Running oncall at this scale means a steady stream of deployment failure tickets every week — each requiring the same investigation cycle:
 
 1. Deployment fails → alert fires (could be routine CI/CD or migration pipeline)
 2. Engineer wakes up, correlates logs across 4-5 systems
@@ -21,9 +21,9 @@ Running oncall at this scale means **30–40 deployment failure tickets per week
 5. Documents it in a ticket
 6. Goes back to sleep
 
-**None of that required human judgment.** It required access to systems, pattern recognition, and execution of a known remediation — at a platform that never sleeps because it serves hundreds of thousands of customers across time zones.
+**None of that required human judgment.** It required access to systems, pattern recognition, and execution of a known remediation — at a platform that never sleeps because it serves a large customer base across time zones.
 
-The goal: build an agent that handles the full triage loop autonomously — from alert to resolution — while maintaining complete auditability and safe fallback to human escalation. The platform this runs on spans **3 production environments**, is built on **19 CDK stacks** with **7-stage Step Functions orchestration**, and maintains **99.8% availability** across all supported workloads.
+The goal: build an agent that handles the full triage loop autonomously — from alert to resolution — while maintaining complete auditability and safe fallback to human escalation. The platform this runs on spans multiple production environments, is built on a multi-stack Step Functions orchestration layer, and maintains strong availability across all supported workloads.
 
 ---
 
@@ -31,9 +31,9 @@ The goal: build an agent that handles the full triage loop autonomously — from
 
 | | |
 |---|---|
-| **Problem** | Oncall for a platform serving 500,000+ end customers and processing millions of migration assets means the same triage loop — alert → logs → pattern → fix → document — repeated dozens of times a week. Every hour of delayed triage is an hour of degraded experience for downstream customers. |
+| **Problem** | Oncall for a large-scale platform running production deployments and a data migration means the same triage loop — alert → logs → pattern → fix → document — repeated many times a week. Every hour of delayed triage is an hour of degraded experience for downstream customers. |
 | **Solution** | An agentic AI system that handles the full triage loop autonomously: governed tool access via MCP, durable execution via Step Functions, knowledge retrieval via RAG, and safe escalation when genuinely novel. |
-| **Impact** | 75%+ adoption, 95% reduction in manual triage time, zero production incidents caused by the agent. 200+ incidents processed, 25+ distinct patterns classified, 90% reduction in weekly oncall triage hours — protecting SLAs for 500,000+ end customers. |
+| **Impact** | Strong voluntary adoption, a significant reduction in manual triage time, zero production incidents caused by the agent. A large volume of incidents processed across many distinct patterns, with a substantial reduction in weekly oncall triage hours — protecting SLAs for a large customer base. |
 
 ---
 
@@ -341,28 +341,28 @@ At 1,000 incidents/month the system works comfortably. At 10,000/month, the fail
 
 ## Results
 
-In production protecting a platform serving **500,000+ end customers**:
+In production protecting a large-scale platform:
 
 | Metric | Before | After |
 |--------|--------|-------|
-| Weekly oncall triage time | 8–10 hours | < 30 minutes |
-| SLA first-contact compliance | ~70% | Consistent compliance |
-| Tickets processed/week | 30–40 manual | 30–40 systematic |
-| Time per standard ticket | 10–30 min | 2–4 min (agent-assisted) |
-| Error patterns documented | 0 (tribal knowledge) | 25+ classified in knowledge base |
+| Weekly oncall triage time | Hours | Minutes |
+| SLA first-contact compliance | Inconsistent | Consistent |
+| Ticket volume | Manual, one at a time | Same volume, systematically handled |
+| Time per standard ticket | Tens of minutes | A few minutes (agent-assisted) |
+| Error patterns documented | Tribal knowledge only | Growing, classified knowledge base |
 
-- **75%+ adoption** among oncall engineers
-- **95% reduction** in manual triage time for covered incident types
-- **60+ incidents auto-resolved** with agent-drafted RCA comments (human-approved before posting)
-- **Zero production incidents** caused by the agent — read-only observation mode for 2 weeks, autonomous actions only after 95%+ classification accuracy confirmed
-- **3-tier severity model**: Tier 1 auto-resolvable, Tier 2 builder-side, Tier 3 deep investigation requiring 5-system investigation (DynamoDB, Step Functions, CloudWatch, S3, deployment API)
-- **3 critical platform issues** root-caused and escalated; **1 production regression** caught same-day
+- **Strong voluntary adoption** among oncall engineers
+- **Significant reduction** in manual triage time for covered incident types
+- **Many incidents auto-resolved** with agent-drafted RCA comments (human-approved before posting)
+- **Zero production incidents** caused by the agent — read-only observation mode initially, autonomous actions only after classification accuracy was confirmed at a high bar
+- **Tiered severity model**: Tier 1 auto-resolvable, Tier 2 builder-side, Tier 3 deep investigation requiring a multi-system investigation (DynamoDB, Step Functions, CloudWatch, S3, deployment API)
+- **Multiple critical platform issues** root-caused and escalated; a production regression caught same-day
 - **Zero recurrence** on patterns added to knowledge base after initial detection
-- **SLA protection** for 500,000+ end customers across a CI/CD and large-scale migration platform
+- **SLA protection** across a CI/CD and large-scale data platform
 
-The remaining 25% of incidents that escalate to human are genuinely novel — the ones that *should* require human judgment.
+The incidents that still escalate to human are genuinely novel — the ones that *should* require human judgment.
 
-**The scope this runs on:** The platform handles both continuous production deployments and a large-scale BI migration processing millions of dashboard assets. The agent covers incident patterns across both workloads.
+**The scope this runs on:** The platform handles both continuous production deployments and a large-scale data migration. The agent covers incident patterns across both workloads.
 
 ---
 
@@ -409,11 +409,11 @@ A production agentic ops platform rarely runs on a single orchestrator. The plat
 | Orchestrator | Used For | Why |
 |-------------|---------|-----|
 | **AWS Step Functions** | Event-driven CI/CD deployments, rollbacks, agent triage workflows | Durable execution, exactly-once, survives Lambda restarts, native AWS integration |
-| **Apache Airflow** | Scheduled batch jobs — SPICE refresh, snapshot creation, data sync, migration DAGs | Cron-based scheduling, DAG dependencies, data pipeline backfill support |
+| **Apache Airflow** | Scheduled batch jobs — cache refresh, snapshot creation, data sync, migration DAGs | Cron-based scheduling, DAG dependencies, data pipeline backfill support |
 
 **Why two orchestrators instead of one:**
 - Step Functions is optimized for event-driven, latency-sensitive workflows that need immediate response (deployment failure alert → triage in < 5 min)
-- Airflow is optimized for scheduled, dependency-aware batch pipelines (refresh all SPICE datasets nightly in correct dependency order)
+- Airflow is optimized for scheduled, dependency-aware batch pipelines (refresh all cached datasets nightly in correct dependency order)
 - Forcing everything through one orchestrator creates a poor fit — either you schedule Step Functions state machines (awkward) or you run real-time triage through Airflow DAGs (too slow)
 
 **The handoff pattern:** Airflow DAGs trigger Step Functions executions for any work that requires durable, auditable, long-running orchestration. Airflow owns scheduling; Step Functions owns execution state.
@@ -499,18 +499,18 @@ creation      often skipped                   always complete
 Knowledge     Lives in engineers' heads       Encoded in knowledge base,
               — leaves when they do           self-improving over time
 
-Toil          High — same patterns            95% reduction
+Toil          High — same patterns            Sharply reduced
               repeated weekly                 
 
-Team          Dreaded oncall rotation         75%+ voluntarily using
-sentiment                                     the agent daily
+Team          Dreaded oncall rotation         Widely, voluntarily
+sentiment                                     using the agent daily
 ```
 
 ---
 
 ## Cost Analysis
 
-Infrastructure cost to protect **500,000+ end customers**:
+Infrastructure cost to protect a large-scale platform:
 
 | Service | Monthly Cost |
 |---------|-------------|
@@ -521,9 +521,9 @@ Infrastructure cost to protect **500,000+ end customers**:
 | **Bedrock/Claude (LLM calls — with 40% semantic cache hit rate)** | **~$270** |
 | **Total** | **~$316/month** |
 
-**Engineer time saved:** 8–10 hours/week → under 30 minutes. At a senior engineer blended rate, that's **$4,000–$5,000/month in engineering capacity reclaimed** — and redirected to feature development and the large-scale migration.
+**Engineer time saved:** hours of weekly triage down to minutes. At a senior engineer blended rate, that's a meaningful chunk of engineering capacity reclaimed every month — and redirected to feature development and the ongoing migration.
 
-**The real ROI is not engineer hours.** It's SLA protection for 500,000+ end customers. Every hour of faster incident resolution is an hour of better customer experience at scale. No dollar figure on that.
+**The real ROI is not engineer hours.** It's SLA protection at scale. Every hour of faster incident resolution is an hour of better customer experience. No dollar figure on that.
 
 **LLM cost optimization levers:**
 - Semantic cache (40-60% hit rate at this volume) — biggest lever
