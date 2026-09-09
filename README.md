@@ -4,7 +4,7 @@
 ![Impact](https://img.shields.io/badge/toil%20reduction-significant-blue)
 ![Adoption](https://img.shields.io/badge/team%20adoption-strong-orange)
 
-> I built a production AI agent that eliminated the majority of manual oncall triage on a large-scale CI/CD and data platform. Here's every architecture decision, tradeoff, and lesson learned.
+> I built a production AI agent that eliminated the majority of manual oncall triage on a large-scale CI/CD and data platform. This repo is the 8 principles that made it safe to run unattended, each backed by a small, real, runnable example in [`examples/`](examples/).
 
 ---
 
@@ -23,17 +23,82 @@ Running oncall at this scale means a steady stream of deployment failure tickets
 
 **None of that required human judgment.** It required access to systems, pattern recognition, and execution of a known remediation — at a platform that never sleeps because it serves a large customer base across time zones.
 
-The goal: build an agent that handles the full triage loop autonomously — from alert to resolution — while maintaining complete auditability and safe fallback to human escalation. The platform this runs on spans multiple production environments, is built on a multi-stack Step Functions orchestration layer, and maintains strong availability across all supported workloads.
-
----
-
-## The Problem → Solution → Impact
+The goal: build an agent that handles the full triage loop autonomously — from alert to resolution — while maintaining complete auditability and safe fallback to human escalation.
 
 | | |
 |---|---|
-| **Problem** | Oncall for a large-scale platform running production deployments and a data migration means the same triage loop — alert → logs → pattern → fix → document — repeated many times a week. Every hour of delayed triage is an hour of degraded experience for downstream customers. |
-| **Solution** | An agentic AI system that handles the full triage loop autonomously: governed tool access via MCP, durable execution via Step Functions, knowledge retrieval via RAG, and safe escalation when genuinely novel. |
-| **Impact** | Strong voluntary adoption, a significant reduction in manual triage time, zero production incidents caused by the agent. A large volume of incidents processed across many distinct patterns, with a substantial reduction in weekly oncall triage hours — protecting SLAs for a large customer base. |
+| **Problem** | Oncall for a large-scale platform means the same triage loop — alert → logs → pattern → fix → document — repeated many times a week. |
+| **Solution** | An agentic system that handles the full loop autonomously: governed tool access, durable execution, knowledge retrieval, and safe escalation when genuinely novel. |
+| **Impact** | Strong voluntary adoption, a significant reduction in manual triage time, zero production incidents caused by the agent. |
+
+---
+
+## The 8 Principles
+
+Each principle below is the answer to a specific way this system failed, or could have failed, in production. Each links to a runnable file in [`examples/`](examples/) that demonstrates the pattern in isolation — no AWS account or credentials needed to run any of them.
+
+### 1. Durable execution beats a custom retry loop
+
+A plain `while` loop in a worker process loses all progress on a crash or restart. Lambda alone also caps execution at 15 minutes — too short for a workflow that's waiting on a deployment to finish retrying. The orchestration layer has to survive failures independently of the business logic running inside it.
+
+**In production:** AWS Step Functions. The non-AWS equivalent is Temporal — same concept, different vendor.
+**Tradeoff:** per-state-transition cost. Fine at this scale; re-evaluate for very high-frequency workflows.
+**Example:** [`examples/01_durable_execution.py`](examples/01_durable_execution.py) — checkpoints progress after every step so a crash resumes where it left off, not from zero.
+
+### 2. Every tool call goes through a governed gateway, not a direct API call
+
+An LLM with direct API access is how you get a production incident caused by the agent itself. There has to be an enforcement point between "the model decided to do X" and "X actually happened" — one that checks permissions and risk level *before* execution, not one that hopes the prompt was followed.
+
+**In production:** an MCP gateway. Every tool is registered with a required permission and a risk tier (LOW/MEDIUM/HIGH); HIGH-risk tools require explicit confirmation. Every call, permitted or denied, is written to an immutable audit trail.
+**Key insight:** don't give the agent the keys to the kingdom — define the minimal tool set per workflow and enforce it at the infrastructure layer, not the prompt.
+**Example:** [`examples/02_governed_tool_gateway.py`](examples/02_governed_tool_gateway.py) — a gateway that checks permission and risk tier before running a tool, and logs every attempt either way.
+
+### 3. Route by workflow shape, not through a single generic pipeline
+
+Batch triage (many known-pattern incidents, speed matters) and deep investigation (one novel incident, accuracy matters) have opposite requirements. Building one system for both optimizes for neither — batch needs fast/cheap/consistent, deep investigation needs thorough/flexible/expensive.
+
+**In production:** incidents are routed up front to one of three configurations — event-driven triage (< 5 min target), batch analysis (throughput-focused), or proactive health checks (compute-sensitive) — each with its own model size, timeout, and tool budget.
+**Example:** [`examples/03_workflow_router.py`](examples/03_workflow_router.py) — picks a batch or deep-investigation config based on whether the incident matches a known pattern and how deep the queue is.
+
+### 4. Pick storage for your data shape, not by default
+
+The instinct with a knowledge base is to reach for a vector database. But incident runbooks are structured — `incident_type → resolution steps` — and an exact-match key lookup is faster and simpler than semantic search for that shape of data. Semantic search earns its place as a *fallback*, not the primary path.
+
+**In production:** DynamoDB, single-table design, composite keys (`PK=incident_type#PATTERN`). ~80% of retrievals are exact-match; a lightweight embedding layer handles the rest.
+**When to reach for a vector DB instead:** unstructured knowledge (free-form docs, chat history) where semantic similarity *is* the primary retrieval mechanism.
+**Example:** [`examples/04_structured_knowledge_lookup.py`](examples/04_structured_knowledge_lookup.py) — exact-match lookup first, semantic fallback only on a miss.
+
+### 5. Decouple ingestion from processing
+
+A cascade of correlated failures — one root cause, many downstream alerts — should not spawn one workflow execution per alert. Without a buffer, 50 simultaneous deployment failures spawn 50 concurrent executions competing for the same fix.
+
+**In production:** an SQS queue in front of the orchestration trigger, with a deduplication window and a dead-letter queue for events that fail to process.
+**Example:** [`examples/05_decoupled_ingestion.py`](examples/05_decoupled_ingestion.py) — buffers a burst of events and drops duplicates within a time window before anything downstream runs.
+
+### 6. Gate the learning loop on confirmed outcomes
+
+The self-improvement loop — write a "learning record" after every resolved incident, retrieve it on the next similar one — only works if bad resolutions don't get written into the knowledge base. **What I got wrong the first time:** I stored raw agent outputs as learnings, so false-positive resolutions became part of the knowledge the agent relied on.
+
+**The fix:** a quality gate. A learning record only becomes retrievable after a human confirms the resolution was correct, or after a no-recurrence window passes with no correction. Rejected resolutions are flagged and excluded from retrieval.
+**Example:** [`examples/06_quality_gated_learning.py`](examples/06_quality_gated_learning.py) — only confirmed records are retrievable; rejected ones are filtered out permanently.
+
+### 7. Make unsafe actions structurally unavailable, not just discouraged
+
+Telling a model "be careful with rollbacks" in a system prompt is not a control — a confidently wrong model just ignores it. Some actions should be impossible for the agent to take on its own, full stop:
+
+- Any production database mutation — always escalates
+- Rollbacks affecting more than one deployment — requires explicit confirmation
+- Any action on a system the agent hasn't seen before — escalates with full context
+
+**Why this matters:** a well-designed agentic system isn't about trusting the LLM to make the right call — it's about designing the failure mode to be safe and recoverable regardless of what the LLM decides.
+**Example:** [`examples/07_blast_radius_guard.py`](examples/07_blast_radius_guard.py) — raises before executing a rollback that exceeds a resource budget, unless the caller explicitly confirms.
+
+### 8. Instrument three signal types from day one, not after incidents force it
+
+Operational metrics (duration, tool call count) tell you if the system is running. Agent-quality metrics (resolution rate, false-positive rate) tell you if the agent is behaving well. Business metrics (manual time saved) tell you if any of this matters. Shipping only the first type is how a team gets paged by a "healthy" agent that's quietly wrong.
+
+**In production:** all three flow into CloudWatch with SLOs on resolution rate (target >75%) and false-positive rate (target <5%).
+**Example:** [`examples/08_observability_signals.py`](examples/08_observability_signals.py) — aggregates all three signal types from a batch of workflow outcomes.
 
 ---
 
@@ -62,8 +127,6 @@ graph TD
 
     L --> N[📚 Learning Record<br/>quality-gated · DynamoDB<br/>improves future retrievals]
 ```
-
----
 
 ## Data Flow
 
@@ -110,232 +173,66 @@ sequenceDiagram
 
 ---
 
-## The Architecture
+## Multi-Orchestrator Architecture
 
-```
-Alert / Deployment Event
-         │
-         ▼
-┌────────────────────────────────────────────────────────┐
-│                    Agentic Ops Platform                │
-│                                                        │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │              Orchestration Layer                 │  │
-│  │   Step Functions state machine — durable,        │  │
-│  │   resumable, exactly-once execution              │  │
-│  └──────────────────┬───────────────────────────────┘  │
-│                     │                                  │
-│  ┌──────────────────▼───────────────────────────────┐  │
-│  │              MCP Gateway                         │  │
-│  │   Governed tool access — every tool call         │  │
-│  │   permission-checked, logged, blast-radius       │  │
-│  │   controlled                                     │  │
-│  └──────────────────┬───────────────────────────────┘  │
-│                     │                                  │
-│  ┌──────────────────▼───────────────────────────────┐  │
-│  │                 LLM (Bedrock/Claude)              │  │
-│  │   Plan → Act → Observe loop                      │  │
-│  │   Tools: log retrieval, state lookup,            │  │
-│  │           ticket creation, deployment API        │  │
-│  └──────────────────┬───────────────────────────────┘  │
-│                     │                                  │
-│  ┌──────────────────▼───────────────────────────────┐  │
-│  │              Knowledge Base (RAG)                │  │
-│  │   DynamoDB — past incidents, resolution          │  │
-│  │   patterns, runbook embeddings                   │  │
-│  └──────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────┘
-         │
-         ▼
-    Resolved ✓  OR  Escalate to human (with full context)
-```
+A production agentic ops platform rarely runs on a single orchestrator. The platform this is based on uses two:
+
+| Orchestrator | Used For | Why |
+|-------------|---------|-----|
+| **AWS Step Functions** | Event-driven CI/CD deployments, rollbacks, agent triage workflows | Durable execution, exactly-once, survives Lambda restarts, native AWS integration |
+| **Apache Airflow** | Scheduled batch jobs — cache refresh, snapshot creation, data sync, migration DAGs | Cron-based scheduling, DAG dependencies, data pipeline backfill support |
+
+**The handoff pattern:** Airflow DAGs trigger Step Functions executions for any work that requires durable, auditable, long-running orchestration. Airflow owns scheduling; Step Functions owns execution state.
 
 ---
 
-## Two Operating Modes
+## Rate Limiting & Security in Pipeline Design
 
-A production agentic ops platform runs in two distinct modes with different requirements:
+Three rate limits you must design for explicitly:
 
-### Mode 1: Batch Triage (throughput-focused)
-Process a queue of N incidents in sequence. Same SOP applied repeatedly. Speed matters — target < 2 minutes per incident.
+| Limit | Source | How to handle |
+|-------|--------|--------------|
+| **LLM tokens/min** | Provider quota | Token bucket in gateway; shed load to smaller model or queue |
+| **Tool call frequency** | Your downstream APIs | Per-caller rate limit in MCP server; back-pressure via SQS visibility timeout |
+| **Step Functions transitions** | AWS service quota | Design state machines to minimize transitions; use `Pass` states sparingly |
 
-```
-Queue of incidents → SOP routing → classify → draft → approve → post → next
-```
+**The most common mistake:** designing for average load. Agentic systems have bursty traffic — a CI pipeline with 50 parallel builds can trigger 50 concurrent workflows at the same second. SQS queue depth is your safety valve; always set a concurrency limit on the Lambda trigger.
 
-Key design choices for batch mode:
-- Smaller, faster model for pattern matching (most incidents fit known patterns)
-- Pre-loaded knowledge base context (don't re-fetch runbooks per incident)
-- Structured output format (consistent RCA templates, not free-form)
-- Batch confirmation: human reviews the entire batch before any posts
-
-### Mode 2: Deep Investigation (quality-focused)
-Single complex incident that doesn't match known patterns. Spend time, not speed.
-
-```
-Single incident → extended context → multi-tool investigation → root cause → escalate or resolve
-```
-
-Key design choices for deep mode:
-- Larger model with longer context window
-- Live tool calls (CloudWatch, DynamoDB, deployment history)
-- Reasoning trace preserved for human review
-- No time pressure — accuracy over latency
-
-**Why this distinction matters in architecture:** If you build one system for both modes, you optimize for neither. Batch mode needs fast, cheap, consistent. Deep investigation needs thorough, flexible, expensive. Separating them by workflow type lets you route to the right configuration automatically.
+**Data boundaries at queue boundaries:** SQS message bodies should contain identifiers (`deployment_id`, `incident_id`), not raw data. The workflow fetches actual data using those identifiers — this keeps sensitive data out of SQS message history and audit trails.
 
 ---
 
-## Every Architecture Decision
+## Security & Compliance Design
 
-### 1. Step Functions for orchestration — not a custom loop
+| Principle | How It's Implemented |
+|-----------|---------------------|
+| **Least privilege** | Each agent identity holds only the permissions needed for its specific workflow. |
+| **Defense in depth** | Three independent layers before any tool executes: permission check → blast-radius guard → input validation. |
+| **Fail closed** | Unknown tool, missing permission, or invalid input → exception, never a silent lower-security fallback. |
+| **Immutable audit trail** | Every action logged with caller identity, arguments, result, timestamp. Append-only. |
+| **Human-in-the-loop for HIGH risk** | Rollbacks and destructive operations always require human confirmation. |
 
-**What I chose:** AWS Step Functions as the workflow backbone.
-
-**Why not a simple `while` loop in Lambda:**
-Lambda has a 15-minute execution limit. A triage workflow can take longer — especially if it's waiting for a deployment to complete or retry. Step Functions gives you:
-- Durable execution (survives Lambda restarts)
-- Built-in retry with exponential backoff
-- Dead letter queues for failed workflows
-- Complete execution history for every run
-- Zero code for state persistence — the state machine handles it
-
-The equivalent in non-AWS world is **Temporal** — same concept, different vendor. The key insight: your orchestration layer must survive failures independently of your business logic.
-
-**Tradeoff:** Step Functions has a per-state-transition cost. For high-frequency workflows, evaluate Temporal or Prefect. At our scale, Step Functions was the right call.
-
----
-
-### 2. MCP for tool access — not direct API calls
-
-**What I chose:** Model Context Protocol (MCP) as the interface between the LLM and every external tool.
-
-**Why not just let the LLM call APIs directly:**
-Direct API access from an LLM is how you get production incidents caused by the agent. MCP adds a governed access layer:
-
-```
-Without MCP:                    With MCP:
-LLM → CloudWatch API            LLM → MCP Gateway → permission check
-LLM → DynamoDB write               → audit log
-LLM → deployment API               → blast-radius guard
-                                   → CloudWatch API (if permitted)
-```
-
-Every tool is registered with:
-- Required permissions (agent must hold them to call)
-- Risk level (LOW / MEDIUM / HIGH)
-- Confirmation requirement for HIGH risk operations (e.g. rollbacks)
-
-The agent cannot call a tool it isn't authorized for. Period. Every call — permitted or denied — is written to an immutable audit trail.
-
-**Key insight:** Don't give agents the keys to the kingdom. Define the minimal set of tools they need for each workflow and enforce it at the infrastructure layer, not in the prompt.
-
----
-
-### 3. DynamoDB for state and knowledge — not a vector DB
-
-**What I chose:** DynamoDB for both operational state and the knowledge base.
-
-**Why not a dedicated vector database:**
-For our use case, the knowledge base was structured: incident patterns, resolution steps, runbook sections. Semantic search was useful but not the primary retrieval mechanism.
-
-DynamoDB gave us:
-- Sub-millisecond reads for pattern lookup by incident type
-- TTL-based expiration for stale runbook entries
-- Single-table design with composite keys: `PK=incident_type#PATTERN, SK=version#timestamp`
-- Same operational footprint as the rest of the platform — no new service to manage
-
-We added a lightweight embedding layer on top for semantic fallback when exact-match failed. But 80% of retrievals were exact-match lookups.
-
-**When to use a vector DB instead:** If your knowledge base is unstructured (free-form documents, PDFs, chat histories) and semantic similarity is the primary retrieval mechanism. We had structured operational runbooks — DynamoDB was right.
-
----
-
-### 4. SQS for event ingestion — not direct Lambda invocations
-
-**What I chose:** SQS queue in front of the orchestration trigger Lambda.
-
-**Why:**
-- Decouples alert producers from the triage workflow
-- Natural buffering during alert storms (multiple failures at once)
-- Dead-letter queue for events that fail to process
-- Exactly-once semantics with deduplication window
-
-**The failure mode this prevented:** A cascade of 50 deployment failures firing simultaneously would have spawned 50 concurrent Step Functions executions. With SQS, we control the concurrency, deduplicate related failures, and process them in priority order.
-
----
-
-### 5. The self-improvement loop — agents getting smarter from production
-
-This was the highest-leverage feature and the hardest to get right.
-
-**The mechanism:**
-1. After every resolved incident, the agent writes a "learning record" to DynamoDB
-2. The record contains: incident pattern, tool calls made, resolution steps, outcome
-3. On the next similar incident, RAG retrieves this record and includes it in context
-4. The agent's behavior improves without retraining
-
-**What I got wrong the first time:** I stored raw agent outputs as learnings. This meant bad resolutions (false positives, wrong root cause) became part of the knowledge base. 
-
-**The fix:** Added a quality gate. Learning records are only written when the incident is resolved *and* the human on-call confirms the resolution was correct (or auto-confirmed after 24 hours with no recurrence). Rejected resolutions are flagged and excluded from RAG retrieval.
-
----
-
-### 6. Behavioral guardrails — the non-negotiables
-
-No matter how good the agent gets, some things never run without a human:
-
-- **Any production database mutation** — always escalates
-- **Rollbacks affecting more than 1 deployment** — requires explicit confirmation
-- **Any action on a system the agent hasn't seen before** — escalates with full context
-
-These aren't prompt instructions. They're enforced at the MCP gateway layer — the agent physically cannot execute these operations without the gate passing.
-
-**Why this matters:** LLMs can be confidently wrong. A well-designed agentic system is not about trusting the LLM — it's about designing the failure modes to be safe and recoverable.
-
----
-
-## Observability
-
-Every agentic workflow emits three types of signals:
-
-**Operational metrics:**
-- Workflow duration (p50, p95, p99)
-- Tool call count per workflow (5-system investigation: DynamoDB, Step Functions, CloudWatch, S3, deployment API)
-- Resolution rate (auto-resolved vs escalated) — target: >75% auto-resolved
-- False positive rate (agent resolved but human reversed) — target: <5%
-
-**Agent quality metrics:**
-- RAG hit rate (knowledge base retrieval success)
-- Tool permission denial rate (agent attempting unauthorized actions)
-- Hallucination proxy (agent calling non-existent tools)
-
-**Business metrics:**
-- Manual triage time eliminated (minutes/week)
-- Incidents resolved without human intervention (%)
-- MTTR delta (agent-assisted vs manual)
-
-All metrics flow into CloudWatch with SLOs defined for resolution rate (>75%) and false positive rate (<5%).
+| Standard | Relevant Controls |
+|----------|-----------------|
+| **SOC 2 Type II** | Complete audit trail of every privileged action, access control enforcement |
+| **ISO 27001** | Least privilege, audit logging, incident response documentation |
+| **NIST AI RMF** | Risk classification per tool (LOW/MEDIUM/HIGH), human oversight for consequential actions |
+| **GDPR / CCPA** | No PII logged in tool arguments; outputs truncated in audit trail |
 
 ---
 
 ## Scaling: What Changes at 10×
 
-At 1,000 incidents/month the system works comfortably. At 10,000/month, the failure modes change:
-
-| Component | 1,000/month | 10,000/month | What to change |
+| Component | 1× | 10× | What to change |
 |-----------|------------|--------------|----------------|
-| **Lambda** | ~33 invocations/day | ~333/day | No change — auto-scales |
-| **Step Functions** | Scales automatically | Scales automatically | No change |
+| **Lambda / Step Functions** | Comfortable | Scales automatically | No change |
 | **SQS** | Default concurrency fine | Tune Lambda concurrency limit | Set `ReservedConcurrentExecutions` per workflow type |
-| **DynamoDB** | On-demand mode OK | Hot partition risk on high-write patterns | Consider DAX cache for read-heavy lookups; partition key design review |
-| **Bedrock/LLM tokens** | ~$50/month | ~$500/month | **Semantic cache becomes mandatory** — 40-60% token savings |
-| **Knowledge base retrieval** | Single-table DynamoDB fine | Evaluate OpenSearch for semantic search | Migrate to vector search when knowledge base > 10K documents |
-| **Learning loop writes** | Per-incident write OK | Batched writes preferred | Buffer corrections in SQS; batch-write every 15 min |
+| **DynamoDB** | On-demand mode OK | Hot partition risk on high-write patterns | Consider DAX cache; partition key design review |
+| **Bedrock/LLM tokens** | Modest spend | 10x spend without mitigation | **Semantic cache becomes mandatory** — meaningful token savings |
+| **Knowledge base** | Single-table DynamoDB fine | Evaluate OpenSearch | Migrate to vector search past ~10K documents |
 
-**The single most important 10× preparation:** Add semantic caching at the LLM gateway layer before anything else. At 10× traffic with 40% cache hit rate, you're processing 6,000 incidents for the cost of 1,000.
-
-**The component that surprises people:** DynamoDB hot partition risk. If your `PK` is `incident_type` and one type (e.g., deployment failures) dominates traffic, all reads land on one partition. At 10×, this causes throttling. Composite keys (`PK = incident_type#shard`, `SK = timestamp`) distribute the load.
+**The single most important 10× preparation:** semantic caching at the LLM gateway layer, before anything else.
+**The component that surprises people:** DynamoDB hot partition risk — if one incident type dominates traffic and `PK = incident_type`, all reads land on one partition. Composite keys (`PK = incident_type#shard`) distribute the load.
 
 ---
 
@@ -347,211 +244,65 @@ In production protecting a large-scale platform:
 |--------|--------|-------|
 | Weekly oncall triage time | Hours | Minutes |
 | SLA first-contact compliance | Inconsistent | Consistent |
-| Ticket volume | Manual, one at a time | Same volume, systematically handled |
 | Time per standard ticket | Tens of minutes | A few minutes (agent-assisted) |
 | Error patterns documented | Tribal knowledge only | Growing, classified knowledge base |
 
 - **Strong voluntary adoption** among oncall engineers
-- **Significant reduction** in manual triage time for covered incident types
-- **Many incidents auto-resolved** with agent-drafted RCA comments (human-approved before posting)
-- **Zero production incidents** caused by the agent — read-only observation mode initially, autonomous actions only after classification accuracy was confirmed at a high bar
-- **Tiered severity model**: Tier 1 auto-resolvable, Tier 2 builder-side, Tier 3 deep investigation requiring a multi-system investigation (DynamoDB, Step Functions, CloudWatch, S3, deployment API)
-- **Multiple critical platform issues** root-caused and escalated; a production regression caught same-day
+- **Zero production incidents** caused by the agent — shipped in read-only observation mode first, autonomous actions only after classification accuracy was confirmed at a high bar
 - **Zero recurrence** on patterns added to knowledge base after initial detection
-- **SLA protection** across a CI/CD and large-scale data platform
+- Multiple platform issues root-caused and escalated; a production regression caught same-day
 
-The incidents that still escalate to human are genuinely novel — the ones that *should* require human judgment.
-
-**The scope this runs on:** The platform handles both continuous production deployments and a large-scale data migration. The agent covers incident patterns across both workloads.
-
----
-
-## Security & Compliance Design
-
-These weren't afterthoughts — they were designed in from day one.
-
-### Principles Applied
-
-| Principle | How It's Implemented |
-|-----------|---------------------|
-| **Least privilege** | Each agent identity holds only the permissions needed for its specific workflow. Read-only agents cannot hold write permissions. |
-| **Defense in depth** | Three independent layers before any tool executes: permission check → blast-radius guard → input validation. Bypassing one doesn't bypass the others. |
-| **Fail closed** | Unknown tool, missing permission, or invalid input → exception. The agent never silently falls back to a lower-security path. |
-| **Immutable audit trail** | Every action logged with caller identity, arguments, result, timestamp. Append-only. Cannot be modified after creation. |
-| **Workload identity** | Agent identity is explicit and verified on every call — not assumed from environment. |
-| **Human-in-the-loop for HIGH risk** | Rollbacks and destructive operations always require human confirmation. Agent cannot bypass this. |
-
-### Compliance Posture
-
-| Standard | Relevant Controls |
-|----------|-----------------|
-| **SOC 2 Type II** | Complete audit trail of every privileged action, access control enforcement |
-| **ISO 27001** | Least privilege, audit logging, incident response documentation |
-| **NIST AI RMF** | Risk classification per tool (LOW/MEDIUM/HIGH), human oversight for consequential actions |
-| **GDPR / CCPA** | No PII logged in tool arguments; outputs truncated in audit trail |
-
-### Threat Model
-
-| Threat | Mitigation |
-|--------|-----------|
-| Agent calls unauthorized tool | Permission enforcement — every call checked |
-| Cascading blast radius | Blast-radius guard — HIGH risk requires confirmed=True |
-| Prompt injection via tool responses | Output validation + bounded context window |
-| Path traversal in file tools | Input validation layer blocks `..` patterns |
-| Agent causes unrecoverable state | Kill switch via SQS trigger disable; in-flight workflows complete safely |
-
----
-
-## Multi-Orchestrator Architecture
-
-A production agentic ops platform rarely runs on a single orchestrator. The platform this is based on uses two:
-
-| Orchestrator | Used For | Why |
-|-------------|---------|-----|
-| **AWS Step Functions** | Event-driven CI/CD deployments, rollbacks, agent triage workflows | Durable execution, exactly-once, survives Lambda restarts, native AWS integration |
-| **Apache Airflow** | Scheduled batch jobs — cache refresh, snapshot creation, data sync, migration DAGs | Cron-based scheduling, DAG dependencies, data pipeline backfill support |
-
-**Why two orchestrators instead of one:**
-- Step Functions is optimized for event-driven, latency-sensitive workflows that need immediate response (deployment failure alert → triage in < 5 min)
-- Airflow is optimized for scheduled, dependency-aware batch pipelines (refresh all cached datasets nightly in correct dependency order)
-- Forcing everything through one orchestrator creates a poor fit — either you schedule Step Functions state machines (awkward) or you run real-time triage through Airflow DAGs (too slow)
-
-**The handoff pattern:** Airflow DAGs trigger Step Functions executions for any work that requires durable, auditable, long-running orchestration. Airflow owns scheduling; Step Functions owns execution state.
-
----
-
-## Pipeline Design Considerations
-
-### The three workflow types — and why they need different designs
-
-A production agentic ops platform typically handles three distinct workflow shapes, each with different requirements:
-
-**1. Event-driven triage (latency-sensitive)**
-- Triggered: deployment failure alert → SQS
-- Target: resolution or escalation in < 5 minutes
-- Design: SQS → Lambda trigger → Step Functions. Short timeout, fast model (smaller Claude variant). Knowledge base retrieval is the critical path — optimize for p95 retrieval latency.
-
-**2. Batch analysis (throughput-sensitive)**
-- Triggered: scheduled (e.g., nightly summary of all incidents)
-- Target: complete within a fixed window, not per-request latency
-- Design: EventBridge schedule → Lambda fan-out → parallel Step Functions executions. Larger model is fine (not time-critical). DynamoDB batch reads vs single reads.
-
-**3. Proactive health checks (compute-sensitive)**
-- Triggered: periodic (every N minutes) across all monitored systems
-- Target: detect anomalies before they become incidents
-- Design: EventBridge → Lambda → direct LLM call (no Step Functions overhead for short-lived checks). Results written to DynamoDB for trend analysis.
-
-**Why this distinction matters:** Building one architecture that tries to handle all three creates trade-offs in the wrong places — a batch processor optimized for throughput will have unacceptable latency for event-driven triage. Separating them lets each be tuned for its actual requirement.
-
----
-
-### Rate limiting in agentic pipelines
-
-Three rate limits you must design for explicitly:
-
-| Limit | Source | How to handle |
-|-------|--------|--------------|
-| **LLM tokens/min** | Provider quota | Token bucket in gateway; shed load to smaller model or queue |
-| **Tool call frequency** | Your downstream APIs | Per-caller rate limit in MCP server; back-pressure via SQS visibility timeout |
-| **Step Functions transitions** | AWS service quota | Design state machines to minimize transitions; use `Pass` states sparingly |
-
-**The most common mistake:** Designing for average load. Agentic systems have bursty traffic — a CI pipeline with 50 parallel builds can trigger 50 concurrent workflows at the same second. Rate limits that look fine under average load collapse under burst. SQS queue depth is your safety valve; always set a concurrency limit on the Lambda trigger.
-
----
-
-### Security considerations for pipeline design
-
-**Principle of least privilege per workflow:** The event-driven triage workflow needs read access to logs and write access to tickets. It should not hold permissions for batch analysis operations (e.g., cross-account DynamoDB reads). Define separate IAM roles per workflow type, not one shared agent role.
-
-**Data boundaries at queue boundaries:** SQS message bodies should contain identifiers (deployment_id, incident_id), not raw data. The Step Functions workflow fetches the actual data using those identifiers. This prevents sensitive data from being logged in SQS message history and audit trails.
-
-**Dead-letter queues as a security signal:** A high DLQ rate can indicate a broken workflow — or it can indicate an adversarial input pattern that's consistently causing failures. Monitor DLQ depth as a security metric, not just an operational one.
+The incidents that still escalate to a human are genuinely novel — the ones that *should* require human judgment.
 
 ---
 
 ## What I'd Do Differently
 
-**1. Start with read-only tools.**
-The first version had write access from day one. I should have shipped a "shadow mode" first — agent observes and recommends, human executes — to build confidence in the agent's judgment before giving it execution authority.
-
-**2. Invest in evaluation earlier.**
-I built the eval framework in month 3. I should have built it in week 1. Every change to the agent's prompts, tools, or knowledge base should run against a regression suite before deploying. (See [agent-eval-framework](https://github.com/TushGoel/agent-eval-framework) for the pattern I now use.)
-
-**3. Explicit blast-radius budgets per workflow.**
-Some workflows can safely touch 5 resources. Others should touch 1. Encode this as a per-workflow configuration, not a global policy.
-
----
-
-## Before vs After
-
-```
-                    BEFORE                          AFTER
-              ──────────────────────          ──────────────────────
-Time per      45–90 min (manual)              2–4 min (automated)
-incident      
-
-3am pages     Engineer woken for              Only novel incidents
-              every known pattern             escalate to human
-
-Ticket        Manual, inconsistent,           Structured, auto-created,
-creation      often skipped                   always complete
-
-Knowledge     Lives in engineers' heads       Encoded in knowledge base,
-              — leaves when they do           self-improving over time
-
-Toil          High — same patterns            Sharply reduced
-              repeated weekly                 
-
-Team          Dreaded oncall rotation         Widely, voluntarily
-sentiment                                     using the agent daily
-```
+1. **Start with read-only tools.** The first version had write access from day one. A "shadow mode" — agent observes and recommends, human executes — would have built confidence in the agent's judgment before granting execution authority.
+2. **Invest in evaluation earlier.** The eval framework was built in month 3; it should have been week 1. See [agent-eval-framework](https://github.com/TushGoel/agent-eval-framework) for the pattern used now.
+3. **Explicit blast-radius budgets per workflow.** Some workflows can safely touch 5 resources, others should touch 1 — that should be per-workflow config, not a global policy.
 
 ---
 
 ## Cost Analysis
 
-Infrastructure cost to protect a large-scale platform:
+Infrastructure cost to protect a large-scale platform is dominated by LLM calls, not compute:
 
-| Service | Monthly Cost |
+| Service | Relative Monthly Cost |
 |---------|-------------|
-| Lambda (execution) | ~$8 |
-| Step Functions (transitions) | ~$25 |
-| DynamoDB (reads/writes) | ~$12 |
-| SQS (messages) | ~$1 |
-| **Bedrock/Claude (LLM calls — with 40% semantic cache hit rate)** | **~$270** |
-| **Total** | **~$316/month** |
+| Lambda + Step Functions + DynamoDB + SQS | Low, combined |
+| **Bedrock/Claude (LLM calls, with semantic cache)** | **Dominant cost driver** |
 
-**Engineer time saved:** hours of weekly triage down to minutes. At a senior engineer blended rate, that's a meaningful chunk of engineering capacity reclaimed every month — and redirected to feature development and the ongoing migration.
+**LLM cost optimization levers, in order of impact:**
+- Semantic cache (biggest lever by far)
+- Smaller model for known-pattern matching; large model reserved for novel incidents
+- RAG-first: retrieve the answer before calling the LLM when the pattern is already known
 
-**The real ROI is not engineer hours.** It's SLA protection at scale. Every hour of faster incident resolution is an hour of better customer experience. No dollar figure on that.
-
-**LLM cost optimization levers:**
-- Semantic cache (40-60% hit rate at this volume) — biggest lever
-- Smaller model for known pattern matching, large model only for novel incidents
-- RAG-first: retrieve the answer before calling the LLM when pattern is known
+**The real ROI isn't engineer hours saved.** It's SLA protection at scale — every hour of faster resolution is an hour of better customer experience.
 
 ---
 
 ## FAQ
 
 **Q: What if the agent makes a wrong decision?**
-Every action is logged with full context. The blast-radius guard prevents any single agent action from affecting more than its configured scope. For high-risk operations (rollbacks), human confirmation is always required.
+Every action is logged with full context. The blast-radius guard prevents any single action from exceeding its configured scope. High-risk operations always require human confirmation.
 
 **Q: How do you handle incidents the agent hasn't seen before?**
-The agent escalates to human with a pre-packaged context bundle: relevant logs, deployment state, similar past incidents, and its own analysis. The human gets everything they need in one place — faster than manual investigation.
+It escalates with a pre-packaged context bundle: relevant logs, deployment state, similar past incidents, and its own analysis — everything a human needs in one place.
 
 **Q: How do you roll back the agent if something goes wrong?**
-The Step Functions workflow has a kill switch: disable the SQS trigger. All in-flight workflows complete safely (Step Functions handles state). New incidents route to human oncall until re-enabled.
+A kill switch disables the SQS trigger. In-flight workflows complete safely; new incidents route to human oncall until re-enabled.
 
 **Q: How does the knowledge base stay accurate?**
-Learning records are quality-gated: only written when the resolution is confirmed correct (human approval OR no recurrence in 24 hours). Rejected resolutions are flagged and excluded from RAG retrieval.
+See [Principle 6](#6-gate-the-learning-loop-on-confirmed-outcomes) — learning records are quality-gated before they're retrievable.
 
 ---
 
 ## Related Projects
 
-- **[production-mcp-server](https://github.com/TushGoel/production-mcp-server)** — Reference implementation of the MCP gateway with permission enforcement and audit trails
+- **[production-mcp-server](https://github.com/TushGoel/production-mcp-server)** — Reference implementation of the MCP gateway from Principle 2: permission enforcement and audit trails
 - **[agent-eval-framework](https://github.com/TushGoel/agent-eval-framework)** — The evaluation framework used to measure and regression-test agent quality
+- **[rag-patterns](https://github.com/TushGoel/rag-patterns)** — Production RAG patterns behind the knowledge retrieval in Principle 4
 
 ---
 
@@ -560,7 +311,7 @@ Learning records are quality-gated: only written when the resolution is confirme
 | Layer | Technology | Why |
 |-------|-----------|-----|
 | Orchestration | AWS Step Functions | Durable execution, built-in retry, state history |
-| LLM | Bedrock (Claude) | On-prem data residency, no data leaving VPC |
+| LLM | Bedrock (Claude) | Data residency, no data leaving VPC |
 | Tool access | MCP | Governed, auditable, permission-enforced |
 | Knowledge base | DynamoDB + embeddings | Structured operational data, sub-ms reads |
 | Event ingestion | SQS | Decoupling, buffering, deduplication |
@@ -580,6 +331,7 @@ MIT
 
 | Repo | What It Is |
 |------|-----------|
-| **[agentic-ops](https://github.com/TushGoel/agentic-ops)** | ← You are here: full system design and architecture breakdown |
+| **[agentic-ops](https://github.com/TushGoel/agentic-ops)** | ← You are here: 8 production principles, each with a runnable example |
 | **[production-mcp-server](https://github.com/TushGoel/production-mcp-server)** | Reference implementation of the MCP governance layer with 12 passing tests |
 | **[agent-eval-framework](https://github.com/TushGoel/agent-eval-framework)** | The evaluation framework used to measure and regression-test agent quality |
+| **[rag-patterns](https://github.com/TushGoel/rag-patterns)** | Production RAG patterns — retrieval, evaluation, self-correction |
